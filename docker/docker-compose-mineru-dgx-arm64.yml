@@ -1,0 +1,54 @@
+# MinerU GPU API Server for DGX Spark (ARM64 + GB10 Blackwell)
+#
+# WARNING: 这是早期单容器实验方案，未在 DGX Spark 实测。
+# DGX Spark 上已验证的生产路径为 tools/mineru-gpu/（独立 vLLM Server + MinerU API）。
+# 除非明确需要单容器快速体验，否则请勿在生产环境使用本文件。
+#
+# This compose file deploys MinerU separately and attaches it to the RAGFlow network.
+#
+# Usage:
+#   cd docker
+#   docker compose -f docker-compose-mineru-dgx-arm64.yml up -d
+#
+# After startup, configure RAGFlow:
+#   Model Provider -> MinerU -> Base URL: http://mineru-api:8000
+#   Knowledge Base -> parse method: mineru
+
+services:
+  mineru-api:
+    image: ${MINERU_IMAGE:-infiniflow/mineru-api:gpu}
+    container_name: mineru-api
+    hostname: mineru-api
+    ports:
+      - ${MINERU_PORT:-8000}:8000
+    env_file: .env
+    environment:
+      - MINERU_MODEL_SOURCE=${MINERU_MODEL_SOURCE:-modelscope}
+      - MINERU_DEVICE_MODE=${MINERU_DEVICE_MODE:-cuda}
+      - MINERU_API_MAX_CONCURRENT_REQUESTS=${MINERU_API_MAX_CONCURRENT_REQUESTS:-3}
+      - MINERU_API_OUTPUT_ROOT=/tmp/mineru_output
+      - MINERU_API_TASK_RETENTION_SECONDS=86400
+      - MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS=300
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+    volumes:
+      - ./mineru-models:/root/.cache/modelscope
+      - ./mineru-output:/tmp/mineru_output
+    networks:
+      - ragflow
+    restart: unless-stopped
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+networks:
+  ragflow:
+    external: true
+    name: docker_ragflow

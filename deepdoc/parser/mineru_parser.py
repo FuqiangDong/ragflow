@@ -97,6 +97,18 @@ class MinerUBackend(StrEnum):
     VLM_HTTP_CLIENT = "vlm-http-client"  # HTTP client for remote vLLM server (CPU only)
 
 
+# Map RAGFlow backend names to the values accepted by the MinerU public API.
+# MinerU API only accepts: pipeline, vlm-engine, hybrid-engine,
+# vlm-http-client, hybrid-http-client.
+MINERU_BACKEND_API_MAP = {
+    "vlm-vllm-engine": "vlm-engine",
+    "vlm-vllm-async-engine": "vlm-engine",
+    "vlm-transformers": "vlm-engine",
+    "vlm-lmdeploy-engine": "vlm-engine",
+    "vlm-mlx-engine": "vlm-engine",
+}
+
+
 class MinerULanguage(StrEnum):
     """MinerU supported languages for OCR (pipeline backend only)."""
 
@@ -205,6 +217,9 @@ class MinerUParser(RAGFlowPdfParser):
     def _is_http_endpoint_valid(url, timeout=5):
         try:
             response = requests.head(url, timeout=timeout, allow_redirects=True)
+            # Some endpoints (e.g., vLLM /health) only support GET, not HEAD.
+            if response.status_code == 405:
+                response = requests.get(url, timeout=timeout, allow_redirects=True)
             return response.status_code in [200, 301, 302, 307, 308]
         except Exception:
             return False
@@ -308,6 +323,12 @@ class MinerUParser(RAGFlowPdfParser):
             data["server_url"] = options.server_url
         elif self.mineru_server_url:
             data["server_url"] = self.mineru_server_url
+
+        # Normalize backend name to match MinerU public API expectations.
+        original_backend = data["backend"]
+        data["backend"] = MINERU_BACKEND_API_MAP.get(original_backend, original_backend)
+        if data["backend"] != original_backend:
+            self.logger.info(f"[MinerU] mapped backend '{original_backend}' -> '{data['backend']}'")
 
         self.logger.info(f"[MinerU] request {data=}")
         self.logger.info(f"[MinerU] request {options=}")
@@ -661,10 +682,25 @@ class MinerUParser(RAGFlowPdfParser):
                 case MinerUContentType.TEXT:
                     section = output.get("text", "")
                 case MinerUContentType.TABLE:
-                    section = output.get("table_body", "") + "\n".join(output.get("table_caption", [])) + "\n".join(
-                        output.get("table_footnote", []))
-                    if not section.strip():
-                        section = "FAILED TO PARSE TABLE"
+                    table_body = output.get("table_body", "")
+                    table_caption = "\n".join(output.get("table_caption", []))
+                    table_footnote = "\n".join(output.get("table_footnote", []))
+                    vlm_description = (output.get("vlm_description") or "").strip()
+                    table_img_path = output.get("table_img_path", "")
+
+                    parts = []
+                    if table_body.strip():
+                        parts.append(table_body)
+                    elif vlm_description:
+                        parts.append(vlm_description)
+                    elif table_img_path:
+                        parts.append("[Table/image content could not be converted to text]")
+                    if table_caption.strip():
+                        parts.append(table_caption)
+                    if table_footnote.strip():
+                        parts.append(table_footnote)
+
+                    section = "\n".join(parts)
                 case MinerUContentType.IMAGE:
                     section = "".join(output.get("image_caption", [])) + "\n" + "".join(
                         output.get("image_footnote", []))
@@ -709,11 +745,12 @@ class MinerUParser(RAGFlowPdfParser):
         return []
 
     def _enhance_images_with_vlm(self, outputs: list[dict[str, Any]], vision_model, callback: Optional[Callable] = None):
-        """Generate semantic descriptions for image blocks via the tenant's
+        """Generate semantic descriptions for image and table-image blocks via the tenant's
         IMAGE2TEXT model, mirroring deepdoc's VisionFigureParser. Each
-        IMAGE block with a readable img_path gets a ``vlm_description``
+        IMAGE block with a readable img_path, or TABLE block with an empty
+        table_body but readable table_img_path, gets a ``vlm_description``
         field that ``_transfer_to_sections`` then folds into the chunk
-        text — closing issue #14869.
+        text — closing issue #14869 and handling screenshots misclassified as tables.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from rag.app.picture import vision_llm_chunk
@@ -722,26 +759,37 @@ class MinerUParser(RAGFlowPdfParser):
         image_jobs = [
             (idx, item)
             for idx, item in enumerate(outputs)
-            if item.get("type") == MinerUContentType.IMAGE
-            and item.get("img_path")
-            and os.path.exists(item["img_path"])
+            if (
+                (
+                    item.get("type") == MinerUContentType.IMAGE
+                    and item.get("img_path")
+                    and os.path.exists(item["img_path"])
+                )
+                or (
+                    item.get("type") == MinerUContentType.TABLE
+                    and not (item.get("table_body") or "").strip()
+                    and item.get("table_img_path")
+                    and os.path.exists(item["table_img_path"])
+                )
+            )
         ]
         if not image_jobs:
             return
 
         if callback:
-            callback(0.78, f"[MinerU] Generating VLM descriptions for {len(image_jobs)} images...")
+            callback(0.78, f"[MinerU] Generating VLM descriptions for {len(image_jobs)} images/tables...")
 
         prompt = vision_llm_figure_describe_prompt()
 
         def worker(idx, item):
             try:
-                with Image.open(item["img_path"]) as img:
+                img_path = item.get("img_path") or item.get("table_img_path")
+                with Image.open(img_path) as img:
                     img.load()
                     desc = vision_llm_chunk(binary=img, vision_model=vision_model, prompt=prompt)
                 return idx, (desc or "").strip()
             except Exception as e:
-                logging.warning(f"[MinerU] VLM description failed for image #{idx}: {e}")
+                logging.warning(f"[MinerU] VLM description failed for image/table #{idx}: {e}")
                 return idx, ""
 
         with ThreadPoolExecutor(max_workers=10) as executor:

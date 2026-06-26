@@ -1,0 +1,72 @@
+# MinerU GPU API Server for DGX Spark (ARM64 + GB10 Blackwell)
+#
+# WARNING: 这是早期单容器实验方案，未在 DGX Spark 实测。
+# DGX Spark 上已验证的生产路径为 tools/mineru-gpu/（独立 vLLM Server + MinerU API）。
+# 除非明确需要单容器快速体验，否则请勿在生产环境使用本文件。
+#
+# Usage:
+#   docker build -f Dockerfile.mineru-dgx-arm64 -t infiniflow/mineru-api:gpu .
+#   docker run -d --gpus all -p 8000:8000 -v ./mineru-models:/root/.cache/modelscope infiniflow/mineru-api:gpu
+#
+# Notes:
+# - vllm-openai:nightly is reported to work on GB10/Blackwell (sm_121).
+# - If nightly is unavailable, build vLLM from source (see docs).
+# - MinerU will auto-detect vLLM and use "vllm-async-engine" backend.
+# - Models are downloaded on first run; mount a volume to persist them.
+
+FROM docker.m.daocloud.io/vllm/vllm-openai:nightly
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_NO_CACHE_DIR=1
+
+# System dependencies for MinerU / OpenCV / PDF processing
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget curl ca-certificates \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Use China mirror for pip if needed (set via build-arg)
+ARG NEED_MIRROR=0
+RUN if [ "$NEED_MIRROR" = "1" ]; then \
+        pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+        pip config set global.extra-index-url "https://wheels.myhloli.com https://download.pytorch.org/whl/cu128"; \
+    fi
+
+# Install MinerU with all features.
+# Pin a recent version known to support ARM64 / GB10.
+# If you hit dependency conflicts, try "mineru[core]" + "mineru[vllm]" separately.
+RUN pip install --no-cache-dir -U "mineru[all]>=0.11.0"
+
+# Verify installations
+RUN python - <<'PY'
+import torch
+import vllm
+import mineru
+print("torch:", torch.__version__, "CUDA:", torch.version.cuda)
+print("vllm:", vllm.__version__)
+print("mineru:", getattr(mineru, "__version__", "unknown"))
+PY
+
+# Model download source: modelscope (recommended for China) or huggingface
+ENV MINERU_MODEL_SOURCE=modelscope
+ENV MINERU_DEVICE_MODE=cuda
+ENV MINERU_API_MAX_CONCURRENT_REQUESTS=3
+ENV MINERU_API_OUTPUT_ROOT=/tmp/mineru_output
+ENV MINERU_API_TASK_RETENTION_SECONDS=86400
+ENV MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS=300
+
+# Optional: pre-download VLM model to reduce first-request latency.
+# This will fetch ~2-4 GB on first build; remove if you prefer runtime download.
+# RUN python - <<'PY'
+# from modelscope import snapshot_download
+# snapshot_download("OpenDataLab/MinerU2.5-2509-1.2B")
+# PY
+
+WORKDIR /app
+
+EXPOSE 8000
+
+# Override vLLM's default entrypoint; start MinerU API server instead.
+ENTRYPOINT ["mineru-api"]
+CMD ["--host", "0.0.0.0", "--port", "8000", "--gpu-memory-utilization", "0.6"]

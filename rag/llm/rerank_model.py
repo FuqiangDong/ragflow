@@ -151,7 +151,11 @@ class LocalAIRerank(Base):
 
     def __init__(self, key, model_name, base_url):
         if base_url.find("/rerank") == -1:
-            self.base_url = urljoin(base_url, "/rerank")
+            if base_url.find("/v1") == -1:
+                # infinity-emb and other OpenAI-compatible local servers expose /v1/rerank
+                self.base_url = urljoin(base_url, "/v1/rerank")
+            else:
+                self.base_url = urljoin(base_url, "/rerank")
         else:
             self.base_url = base_url
         self.headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
@@ -239,8 +243,11 @@ class OpenAI_APIRerank(Base):
         normalized_base_url = (base_url or "").strip()
         if "/rerank" in normalized_base_url:
             self.base_url = normalized_base_url.rstrip("/")
-        else:
+        elif "/v1" in normalized_base_url:
             self.base_url = urljoin(f"{normalized_base_url.rstrip('/')}/", "rerank").rstrip("/")
+        else:
+            # infinity-emb and other OpenAI-compatible local servers expose /v1/rerank
+            self.base_url = urljoin(f"{normalized_base_url.rstrip('/')}/", "v1/rerank").rstrip("/")
         self.headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
         self.model_name = model_name.split("___")[0]
 
